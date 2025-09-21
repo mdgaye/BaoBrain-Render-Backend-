@@ -1,69 +1,91 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 import httpx
 import os
 import logging
 
-# Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+NEW_BACKEND = os.getenv("NEW_BACKEND", "https://api.baobrain.com")
 
-# CORS middleware (same as your current setup)
+app = FastAPI(title="BaoBrain Proxy")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
-# Forward events to your new backend
-@app.post("/api/collect/batch")
-async def forward_events(request: Request):
-    try:
-        data = await request.json()
-        logger.info(f"Forwarding event data to baobrain.com backend")
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.baobrain.com/api/collect/batch",
-                json=data,
-                timeout=30.0
-            )
-            
-        logger.info(f"Forward response: {response.status_code}")
-        return {"status": "forwarded", "code": response.status_code}
-        
-    except Exception as e:
-        logger.error(f"Forward error: {str(e)}")
-        return {"status": "error", "message": str(e)}, 500
+# ---- Simple home + health ----
+@app.get("/")
+async def home():
+    return {"ok": True, "service": "BaoBrain proxy", "docs": "/docs"}
 
-# Serve your tracker files (keep existing functionality)
-@app.get("/static/{file_path}")
-async def serve_static(file_path: str):
-    return FileResponse(f"static/{file_path}")
-
-@app.get("/bigcommerce/{file_path}")
-async def serve_bigcommerce(file_path: str):
-    return FileResponse(f"static/{file_path}")
-
-@app.get("/demographics.js")
-async def serve_demographics():
-    return FileResponse("static/demographics.js")
-
-@app.get("/{file_path}")
-async def serve_root_files(file_path: str):
-    # For files served directly from root like demographics.js
-    return FileResponse(f"static/{file_path}")
-
-# Health check
 @app.get("/health")
-async def health_check():
+async def health():
     return {"status": "healthy"}
 
+# ---- Track endpoints (both batch and non-batch) ----
+@app.post("/api/collect")
+async def forward_collect(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = await request.body()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(f"{NEW_BACKEND}/api/collect", json=payload if isinstance(payload, dict) else None, content=None if isinstance(payload, dict) else payload)
+    return JSONResponse(status_code=r.status_code, content=(r.json() if r.headers.get("content-type","").startswith("application/json") else {"status": r.status_code}))
+
+@app.post("/api/collect/batch")
+async def forward_collect_batch(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = await request.body()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(f"{NEW_BACKEND}/api/collect/batch", json=payload if isinstance(payload, dict) else None, content=None if isinstance(payload, dict) else payload)
+    return JSONResponse(status_code=r.status_code, content=(r.json() if r.headers.get("content-type","").startswith("application/json") else {"status": r.status_code}))
+
+# ---- Static proxy (no need to ship files here) ----
+@app.get("/static/{path:path}")
+async def proxy_static(path: str):
+    url = f"{NEW_BACKEND}/static/{path}"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(url)
+    return Response(content=r.content, status_code=r.status_code, headers={"content-type": r.headers.get("content-type","application/octet-stream")})
+
+# BigCommerce tracker path compatibility
+@app.get("/bigcommerce/{path:path}")
+async def proxy_bc_static(path: str):
+    url = f"{NEW_BACKEND}/bigcommerce/{path}"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(url)
+    return Response(content=r.content, status_code=r.status_code, headers={"content-type": r.headers.get("content-type","application/octet-stream")})
+
+# Root-served files compatibility (e.g., /demographics.js)
+@app.get("/{file}.js")
+async def proxy_root_js(file: str):
+    url = f"{NEW_BACKEND}/{file}.js"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(url)
+    return Response(content=r.content, status_code=r.status_code, headers={"content-type": r.headers.get("content-type","application/javascript")})
+
+# ---- Optional: catch-all proxy for other API routes ----
+@app.api_route("/api/{path:path}", methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"])
+async def proxy_api(path: str, request: Request):
+    target = f"{NEW_BACKEND}/api/{path}"
+    method = request.method
+    headers = dict(request.headers)
+    # strip hop-by-hop headers
+    for h in ["host", "content-length", "connection", "accept-encoding", "x-forwarded-for", "x-forwarded-proto"]:
+        headers.pop(h, None)
+    body = await request.body()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.request(method, target, headers=headers, content=body)
+    return Response(content=r.content, status_code=r.status_code, headers={"content-type": r.headers.get("content-type","application/octet-stream")})
+
 if __name__ == "__main__":
-    import uvicorn
+    import uvicorn, os
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
