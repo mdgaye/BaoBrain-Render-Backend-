@@ -214,7 +214,13 @@ async def serve_shopify_demographics():
     return Response(content=js, media_type="application/javascript")
 
 
+@app.get("/pixel.js")
+async def pixel_js():
+    return await _proxy_get("/pixel.js", "text/javascript")
 
+@app.get("/integrations/assets/ga4-loader-{site_id}.js")
+async def ga4_loader_js(site_id: str):
+    return await _proxy_get(f"/integrations/assets/ga4-loader-{site_id}.js", "text/javascript")
 
 # ------------------------------------------------------------------------------
 # Event forwarding
