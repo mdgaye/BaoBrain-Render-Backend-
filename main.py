@@ -186,14 +186,33 @@ async def demographics_static_js():
 # ------------------------------------------------------------------------------
 
 
-# ADD THESE SHOPIFY ROUTES
-@app.get("/shopify/sessions.js")
-async def shopify_sessions_js():
-    return await _proxy_get("/shopify/sessions.js", "text/javascript")
-
+# Serve tracker under /shopify/* too
 @app.get("/shopify/tracker.js")
-async def shopify_tracker_js():
-    return await _proxy_get("/shopify/tracker.js", "text/javascript")
+async def serve_shopify_tracker():
+    # Prefer file if it exists; otherwise embed a minimal loader or 404
+    p = Path(__file__).resolve().parent.parent / "my-analytics-frontend" / "public" / "tracker.js"
+    if p.is_file():
+        return FileResponse(str(p), media_type="application/javascript")
+    # Fallback: tiny loader that fetches your root tracker
+    js = "/* fallback */ (function(){var s=document.createElement('script');s.src='/tracker.js';document.head.appendChild(s);}());"
+    return Response(content=js, media_type="application/javascript")
+
+@app.get("/shopify/sessions.js")
+async def serve_shopify_sessions():
+    p = Path(__file__).resolve().parent.parent / "my-analytics-frontend" / "public" / "sessions.js"
+    if p.is_file():
+        return FileResponse(str(p), media_type="application/javascript")
+    js = "/* fallback */ (function(){var s=document.createElement('script');s.src='/sessions.js';document.head.appendChild(s);}());"
+    return Response(content=js, media_type="application/javascript")
+
+@app.get("/shopify/demographics.js")
+async def serve_shopify_demographics():
+    p = Path(__file__).resolve().parent.parent / "my-analytics-frontend" / "public" / "demographics.js"
+    if p.is_file():
+        return FileResponse(str(p), media_type="application/javascript")
+    js = "/* fallback */ (function(){var s=document.createElement('script');s.src='/demographics.js';document.head.appendChild(s);}());"
+    return Response(content=js, media_type="application/javascript")
+
 
 
 
