@@ -1,4 +1,3 @@
-# main.py
 import os
 import time
 import logging
@@ -15,11 +14,11 @@ from starlette.responses import JSONResponse
 # ------------------------------------------------------------------------------
 UPSTREAM_BASE = os.getenv("UPSTREAM_BASE", "https://api.baobrain.com")
 FORWARD_TIMEOUT = float(os.getenv("FORWARD_TIMEOUT_SEC", "30"))
-FORWARD_RETRIES = int(os.getenv("FORWARD_RETRIES", "2"))  # number of retries on 5xx
+FORWARD_RETRIES = int(os.getenv("FORWARD_RETRIES", "2")) # number of retries on 5xx
 DIAG_BUFFER_SIZE = int(os.getenv("DIAG_BUFFER_SIZE", "100"))
 
 # optional: restrict /diag/forwards with a simple token
-DIAG_TOKEN = os.getenv("DIAG_TOKEN", "")  # if set, require ?token=...
+DIAG_TOKEN = os.getenv("DIAG_TOKEN", "") # if set, require ?token=...
 
 # ------------------------------------------------------------------------------
 # Logging
@@ -37,7 +36,7 @@ app = FastAPI(title="BaoBrain proxy", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],    # tighten if you want
+    allow_origins=["*"], # tighten if you want
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -46,11 +45,12 @@ app.add_middleware(
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
-async def _proxy_get(path: str, media_type: str = "text/javascript") -> Response:
+async def _proxy_get(path: str, query_string: str = "", media_type: str = "text/javascript") -> Response:
     """
     GET a file from the upstream and stream it back as-is.
     """
-    url = f"{UPSTREAM_BASE}{path}"
+    full_path = f"{path}?{query_string}" if query_string else path
+    url = f"{UPSTREAM_BASE}{full_path}"
     log.info(f"[proxy-get] {url}")
     async with httpx.AsyncClient(timeout=FORWARD_TIMEOUT) as client:
         r = await client.get(url)
@@ -117,7 +117,7 @@ async def _forward_json(
                 err_text = str(e)
                 log.error(f"[forward] exception on attempt {i+1}/{attempts}: {err_text}")
                 if i == attempts - 1:
-                    upstream_status = 599  # non-standard: network error
+                    upstream_status = 599 # non-standard: network error
 
     # record a compact diagnostic
     try:
@@ -166,61 +166,41 @@ async def health():
 # Tracker JS (always proxy from upstream)
 # ------------------------------------------------------------------------------
 @app.get("/bigcommerce/sessions.js")
-async def bc_sessions_js():
-    return await _proxy_get("/bigcommerce/sessions.js", "text/javascript")
+async def bc_sessions_js(request: Request):
+    return await _proxy_get("/bigcommerce/sessions.js", request.url.query, "text/javascript")
 
 @app.get("/bigcommerce/tracker.js")
-async def bc_tracker_js():
-    return await _proxy_get("/bigcommerce/tracker.js", "text/javascript")
+async def bc_tracker_js(request: Request):
+    return await _proxy_get("/bigcommerce/tracker.js", request.url.query, "text/javascript")
 
-@app.get("/demographics.js")
-async def demographics_js():
-    return await _proxy_get("/demographics.js", "text/javascript")
-
-@app.get("/static/demographics.js")
-async def demographics_static_js():
-    return await _proxy_get("/static/demographics.js", "text/javascript")
-
-# ------------------------------------------------------------------------------
-# Tracker JS (always proxy from upstream)
-# ------------------------------------------------------------------------------
-
-
-# Serve tracker under /shopify/* too
-@app.get("/shopify/tracker.js")
-async def serve_shopify_tracker():
-    # Prefer file if it exists; otherwise embed a minimal loader or 404
-    p = Path(__file__).resolve().parent.parent / "my-analytics-frontend" / "public" / "tracker.js"
-    if p.is_file():
-        return FileResponse(str(p), media_type="application/javascript")
-    # Fallback: tiny loader that fetches your root tracker
-    js = "/* fallback */ (function(){var s=document.createElement('script');s.src='/tracker.js';document.head.appendChild(s);}());"
-    return Response(content=js, media_type="application/javascript")
-
+# SHOPIFY ROUTES - should proxy, not serve local files
 @app.get("/shopify/sessions.js")
-async def serve_shopify_sessions():
-    p = Path(__file__).resolve().parent.parent / "my-analytics-frontend" / "public" / "sessions.js"
-    if p.is_file():
-        return FileResponse(str(p), media_type="application/javascript")
-    js = "/* fallback */ (function(){var s=document.createElement('script');s.src='/sessions.js';document.head.appendChild(s);}());"
-    return Response(content=js, media_type="application/javascript")
+async def shopify_sessions_js(request: Request):
+    return await _proxy_get("/shopify/sessions.js", request.url.query, "text/javascript")
+
+@app.get("/shopify/tracker.js")
+async def shopify_tracker_js(request: Request):
+    return await _proxy_get("/shopify/tracker.js", request.url.query, "text/javascript")
 
 @app.get("/shopify/demographics.js")
-async def serve_shopify_demographics():
-    p = Path(__file__).resolve().parent.parent / "my-analytics-frontend" / "public" / "demographics.js"
-    if p.is_file():
-        return FileResponse(str(p), media_type="application/javascript")
-    js = "/* fallback */ (function(){var s=document.createElement('script');s.src='/demographics.js';document.head.appendChild(s);}());"
-    return Response(content=js, media_type="application/javascript")
+async def shopify_demographics_js(request: Request):
+    return await _proxy_get("/shopify/demographics.js", request.url.query, "text/javascript")
 
+@app.get("/demographics.js")
+async def demographics_js(request: Request):
+    return await _proxy_get("/demographics.js", request.url.query, "text/javascript")
+
+@app.get("/static/demographics.js")
+async def demographics_static_js(request: Request):
+    return await _proxy_get("/static/demographics.js", request.url.query, "text/javascript")
 
 @app.get("/pixel.js")
-async def pixel_js():
-    return await _proxy_get("/pixel.js", "text/javascript")
+async def pixel_js(request: Request):
+    return await _proxy_get("/pixel.js", request.url.query, "text/javascript")
 
 @app.get("/integrations/assets/ga4-loader-{site_id}.js")
-async def ga4_loader_js(site_id: str):
-    return await _proxy_get(f"/integrations/assets/ga4-loader-{site_id}.js", "text/javascript")
+async def ga4_loader_js(site_id: str, request: Request):
+    return await _proxy_get(f"/integrations/assets/ga4-loader-{site_id}.js", request.url.query, "text/javascript")
 
 # ------------------------------------------------------------------------------
 # Event forwarding
