@@ -182,6 +182,22 @@ async def demographics_static_js():
     return await _proxy_get("/static/demographics.js", "text/javascript")
 
 # ------------------------------------------------------------------------------
+# Tracker JS (always proxy from upstream)
+# ------------------------------------------------------------------------------
+
+
+# ADD THESE SHOPIFY ROUTES
+@app.get("/shopify/sessions.js")
+async def shopify_sessions_js():
+    return await _proxy_get("/shopify/sessions.js", "text/javascript")
+
+@app.get("/shopify/tracker.js")
+async def shopify_tracker_js():
+    return await _proxy_get("/shopify/tracker.js", "text/javascript")
+
+
+
+# ------------------------------------------------------------------------------
 # Event forwarding
 # ------------------------------------------------------------------------------
 @app.options("/api/collect")
