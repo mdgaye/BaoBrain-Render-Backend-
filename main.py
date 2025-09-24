@@ -196,7 +196,37 @@ async def demographics_static_js(request: Request):
 
 @app.get("/pixel.js")
 async def pixel_js(request: Request):
-    return await _proxy_get("/pixel.js", request.url.query, "text/javascript")
+    # Read incoming query params exactly as your integrations send them
+    qp = dict(request.query_params)
+    site_id = qp.get("site_id", "")
+    site_token = qp.get("site_token", "")
+    shop = qp.get("shop", "")
+
+    # Point to your real backend that actually serves the bundle
+    # UPSTREAM_BASE already comes from env; ensure it's your Cloud Run / API base and HTTPS.
+    tracker_url = (
+        f"{UPSTREAM_BASE.rstrip('/')}/static/tracker.bundle.js"
+        f"?site_id={site_id}&site_token={site_token}&shop={shop}"
+    )
+
+    # Return JS loader so browsers won’t block it as mixed content
+    js = (
+        "(function(){var s=document.createElement('script');"
+        "s.async=true;"
+        f"s.src='{tracker_url}';"
+        "document.head.appendChild(s);})();"
+    )
+
+    return Response(
+        content=js,
+        media_type="application/javascript",
+        headers={"Cache-Control": "public, max-age=300"},
+        status_code=200,
+    )
+
+@app.get("/static/tracker.bundle.js")
+async def tracker_bundle_js(request: Request):
+    return await _proxy_get("/static/tracker.bundle.js", request.url.query, "application/javascript")
 
 @app.get("/integrations/assets/ga4-loader-{site_id}.js")
 async def ga4_loader_js(site_id: str, request: Request):
