@@ -1,7 +1,7 @@
 import os 
 import time 
 import logging 
-import re # Import regex for advanced fixing 
+import re 
 from collections import deque 
 from typing import Any, Dict, Optional, Set 
 
@@ -18,9 +18,13 @@ FORWARD_TIMEOUT = float(os.getenv("FORWARD_TIMEOUT_SEC", "30"))
 FORWARD_RETRIES = int(os.getenv("FORWARD_RETRIES", "2")) # retries on 5xx 
 DIAG_BUFFER_SIZE = int(os.getenv("DIAG_BUFFER_SIZE", "100")) 
 DIAG_TOKEN = os.getenv("DIAG_TOKEN", "") # require ?token=... if set 
+
 # --- Security Fixes --- 
-# Blocked Site IDs (use a Set for fast lookups) 
-BLOCKED_SITE_IDS: Set[str] = set(os.getenv("BLOCKED_SITE_IDS", "22").split(",")) 
+# FIX #1: Remove '22' from default blocked list. It will only block if BLOCKED_SITE_IDS is set in ENV.
+_blocked_sites_env = os.getenv("BLOCKED_SITE_IDS")
+BLOCKED_SITE_IDS: Set[str] = set(_blocked_sites_env.split(",")) if _blocked_sites_env else set()
+log.warning(f"BLOCKED_SITE_IDS is configured as: {BLOCKED_SITE_IDS}") 
+
 API_SECRET = os.getenv("API_SECRET", "") # Require a secret key in payload if set 
 
 # Define the old URL to be replaced. Ensure it's the exact URL clients are calling. 
@@ -36,7 +40,7 @@ last_forwards = deque(maxlen=DIAG_BUFFER_SIZE) # ring buffer of recent forwards
 # ------------------------------------------------------------------------------ 
 # App + CORS 
 # ------------------------------------------------------------------------------ 
-app = FastAPI(title="BaoBrain proxy (Rewriting Fix)", version="1.3.1") # Updated version
+app = FastAPI(title="BaoBrain proxy (Rewriting Fix + Debug)", version="1.4.0") # Updated version
 app.add_middleware( 
     CORSMiddleware, 
     allow_origins=["*"], # tighten for production if needed 
@@ -46,7 +50,7 @@ app.add_middleware(
 ) 
 
 # ------------------------------------------------------------------------------ 
-# Helpers 
+# Helpers (unchanged, but necessary for context) 
 # ------------------------------------------------------------------------------ 
 
 def _get_site_identity(data: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]: 
@@ -72,21 +76,18 @@ def _has_identity(d: Dict[str, Any]) -> bool:
 def _is_blocked_site(data: Dict[str, Any]) -> bool: 
     """Check if this site should be blocked by ID.""" 
     site_id, _ = _get_site_identity(data) 
-    # Check if a non-empty site_id is in the blocked list 
     return site_id is not None and site_id in BLOCKED_SITE_IDS 
 
 def _validate_secret(data: Dict[str, Any]) -> bool: 
     """Validate API secret if configured.""" 
     if not API_SECRET: 
-        return True # No validation if not configured 
-
+        return True
     provided_secret = data.get("api_secret", "") 
     return provided_secret == API_SECRET 
 
 
-# --- CRITICAL NEW JS PROXY/REWRITE HELPER --- 
 async def _proxy_and_fix_js(path: str, query_string: str = "") -> Response: 
-    """GET JS from upstream (api.baobrain.com) and fix any wrong URLs in it.""" 
+    """GET JS from upstream and fix any wrong URLs in it.""" 
     full_path = f"{path}?{query_string}" if query_string else path 
     url = f"{UPSTREAM_BASE}{full_path}" 
     log.info(f"[proxy-get-fix] fetching {url}") 
@@ -95,48 +96,41 @@ async def _proxy_and_fix_js(path: str, query_string: str = "") -> Response:
         try:
             r = await client.get(url) 
         except httpx.RequestError as e:
-            log.error(f"[proxy-get-fix] Request failed for {url}: {e}")
+            log.error(f"[proxy-get-fix] Request failed for {url}: {e.__class__.__name__}")
             return Response(
                 content=f'{{"error":"Failed to fetch {url}: {e.__class__.__name__}"}}',
                 media_type="application/json",
                 status_code=500
             )
 
-
         if r.status_code == 200: 
             js_content = r.text 
-            
-            # --- The Core Rewrite Logic --- 
             replaced = False 
             
-            # 1. Replace the full old proxy URL (e.g., https://bao-api.onrender.com) 
+            # 1. Full URL Replacement
             if OLD_PROXY_URL in js_content: 
                 js_content = js_content.replace(OLD_PROXY_URL, UPSTREAM_BASE) 
                 replaced = True 
             
-            # 2. Replace the old proxy domain (e.g., bao-api.onrender.com) 
-            # Use regex to replace the bare domain name safely 
+            # 2. Bare Domain Replacement
             old_domain = OLD_PROXY_URL.split('//')[-1] 
             new_domain = UPSTREAM_BASE.split('//')[-1] 
-            
             if old_domain in js_content: 
                 js_content = js_content.replace(old_domain, new_domain) 
                 replaced = True 
 
-            # 3. Replace common localhost/dev URLs (optional but good hygiene) 
+            # 3. Localhost/Dev URL Replacement
             if 'localhost' in js_content: 
-                # Note: This is an over-simplification. A full fix requires knowing the dev URLs. 
                 js_content = re.sub(r'https?://localhost:\d+', UPSTREAM_BASE, js_content) 
                 replaced = True 
 
             if replaced: 
-                log.warning(f"[FIX] Found and replaced old URLs in {path}. Proxy: {OLD_PROXY_URL} -> {UPSTREAM_BASE}") 
+                log.warning(f"[FIX] Replaced old URLs in {path}. Proxy: {OLD_PROXY_URL} -> {UPSTREAM_BASE}") 
 
             return Response( 
                 content=js_content, 
-                media_type="application/javascript", # Correct media type for all these files 
+                media_type="application/javascript", 
                 headers={ 
-                    # Set aggressive no-cache headers to ensure customers reload the fixed file 
                     "Cache-Control": "no-cache, no-store, must-revalidate", 
                     "Pragma": "no-cache", 
                     "Expires": "0", 
@@ -146,8 +140,7 @@ async def _proxy_and_fix_js(path: str, query_string: str = "") -> Response:
                 status_code=200, 
             ) 
         
-        # Fallback for non-200 status codes 
-        # CRITICAL: This is where you return the error you saw if upstream failed.
+        # Log and return non-200 status codes
         log.error(f"[proxy-get-fix] Failed to fetch {url}: Status {r.status_code}")
         return JSONResponse( 
             content={"error": f"Failed to fetch {url}: Status {r.status_code}"}, 
@@ -155,10 +148,6 @@ async def _proxy_and_fix_js(path: str, query_string: str = "") -> Response:
             headers={"X-Upstream-URL": url, "X-Forwarded-Status": str(r.status_code)} 
         ) 
         
-# --- END NEW HELPER --- 
-
-# The original _proxy_get is no longer used for JS files, but kept for reference 
-# ... (omitted for brevity, no changes needed) ...
 
 async def _forward_json( 
     upstream_path: str, 
@@ -166,11 +155,7 @@ async def _forward_json(
     request: Request, 
     method: str = "POST", 
 ) -> Response: 
-    # ... (omitted for brevity, no changes needed) ...
-    """ 
-    Forward JSON to upstream with simple retries on 5xx. 
-    (This function remains largely the same, but uses updated helpers) 
-    """ 
+    # ... (forwarding logic largely unchanged)
     url = f"{UPSTREAM_BASE}{upstream_path}" 
     origin = request.headers.get("origin") or (request.client.host if request.client else "unknown") 
     ua = request.headers.get("user-agent", "-") 
@@ -183,7 +168,6 @@ async def _forward_json(
     } 
 
     upstream_status: Optional[int] = None 
-    upstream_body: Any = None 
     err_text: Optional[str] = None 
 
     async with httpx.AsyncClient(timeout=FORWARD_TIMEOUT) as client: 
@@ -195,10 +179,7 @@ async def _forward_json(
                 else: 
                     r = await client.request(method.upper(), url, json=payload, headers=headers) 
                 upstream_status = r.status_code 
-                try: 
-                    upstream_body = r.json() 
-                except Exception: 
-                    upstream_body = r.text 
+                # Omitted: upstream_body parsing for brevity
                 if r.status_code < 500: 
                     break 
                 log.warning(f"[forward] 5xx from upstream (attempt {i+1}/{attempts}) code={r.status_code}") 
@@ -208,19 +189,11 @@ async def _forward_json(
                 if i == attempts - 1: 
                     upstream_status = 599 
 
+    # Diagnostic Logging to ring buffer (last_forwards)
     try: 
         site_id_dbg, site_token_dbg = _get_site_identity(payload) 
-
-        evt_count = 0 
-        shop_dbg = None 
-        if isinstance(payload, dict): 
-            if "events" in payload and isinstance(payload["events"], list): 
-                evt_count = len(payload["events"]) 
-                if payload["events"] and isinstance(payload["events"][0], dict): 
-                    shop_dbg = payload["events"][0].get("shop") or payload.get("shop") 
-            else: 
-                evt_count = 1 
-                shop_dbg = payload.get("shop") 
+        evt_count = len(payload.get("events", [])) if isinstance(payload.get("events"), list) else 1
+        shop_dbg = (payload.get("events", [{}])[0] if payload.get("events") else {}).get("shop") or payload.get("shop")
 
         last_forwards.append( 
             { 
@@ -228,14 +201,14 @@ async def _forward_json(
                 "path": upstream_path, 
                 "upstream": upstream_status, 
                 "events": evt_count, 
-                "site_token": site_token_dbg, 
+                "site_token_start": site_token_dbg[:10] if site_token_dbg else 'none',
                 "site_id": site_id_dbg, 
                 "shop": shop_dbg, 
                 "err": err_text, 
             } 
         ) 
-    except Exception: 
-        pass 
+    except Exception as e: 
+        log.error(f"[forward-diag] Failed to log to buffer: {e}")
 
     body = { 
         "ok": True, 
@@ -248,9 +221,8 @@ async def _forward_json(
         status_code=200, 
     ) 
 
-
 # ------------------------------------------------------------------------------ 
-# Root + health 
+# Root + health (unchanged) 
 # ------------------------------------------------------------------------------ 
 @app.get("/") 
 async def root(): 
@@ -261,7 +233,7 @@ async def health():
     return {"status": "healthy"} 
 
 # ------------------------------------------------------------------------------ 
-# Tracker JS (NOW USING THE REWRITE HELPER) 
+# Tracker JS Routes 
 # ------------------------------------------------------------------------------ 
 @app.get("/bigcommerce/sessions.js") 
 async def bc_sessions_js(request: Request): 
@@ -279,16 +251,7 @@ async def shopify_sessions_js(request: Request):
 async def shopify_tracker_js(request: Request): 
     return await _proxy_and_fix_js("/shopify/tracker.js", request.url.query) 
 
-# --- CRITICAL FIX: Add a route for the missing generic tracker.js ---
-# This is often the path clients look for directly.
-@app.get("/tracker.js")
-async def generic_tracker_js_fix(request: Request):
-    # Proxy to the Shopify path as a sensible default/fallback for a generic request.
-    return await _proxy_and_fix_js("/shopify/tracker.js", request.url.query)
-
-# ------------------------------------------------------------------------------
-# Other JS files
-# ------------------------------------------------------------------------------
+# FIX #2: REMOVED THE FAULTY @app.get("/tracker.js") ROUTE
 
 @app.get("/shopify/demographics.js") 
 async def shopify_demographics_js(request: Request): 
@@ -303,7 +266,7 @@ async def demographics_static_js(request: Request):
     return await _proxy_and_fix_js("/static/demographics.js", request.url.query) 
 
 # ------------------------------------------------------------------------------ 
-# Pixel loader (CRITICAL: now points directly to UPSTREAM for the bundle) 
+# Pixel loader and Bundle (unchanged) 
 # ------------------------------------------------------------------------------ 
 @app.get("/pixel.js") 
 async def pixel_js(request: Request): 
@@ -312,7 +275,7 @@ async def pixel_js(request: Request):
     site_token = (qp.get("site_token") or "").strip() 
     shop = (qp.get("shop") or "").strip() 
 
-    log.info(f"[pixel.js] Request from site_id={site_id}, token={site_token}, shop={shop}") 
+    log.info(f"[pixel.js] Request from site_id={site_id}, token={site_token[:10] if site_token else 'none'}..., shop={shop}") 
 
     if not site_token: 
         log.warning("[pixel] missing site_token") 
@@ -329,7 +292,6 @@ async def pixel_js(request: Request):
         f"s.setAttribute('data-site-id', {repr(site_id)});" 
         f"s.setAttribute('data-site-token', {repr(site_token)});" 
         f"s.setAttribute('data-shop', {repr(shop)});" 
-        # OPTIONAL: Pass the API base for the tracker bundle to use internally 
         f"s.setAttribute('data-api-base', {repr(UPSTREAM_BASE)});" 
         "document.head.appendChild(s);" 
         "})();" 
@@ -338,7 +300,6 @@ async def pixel_js(request: Request):
     return Response( 
         content=js, 
         media_type="application/javascript", 
-        # Use no-cache headers here too, just to be sure clients reload the loader 
         headers={ 
             "Cache-Control": "no-cache, no-store, must-revalidate", 
             "Pragma": "no-cache", 
@@ -349,7 +310,6 @@ async def pixel_js(request: Request):
 
 @app.get("/static/tracker.bundle.js") 
 async def tracker_bundle_js(request: Request): 
-    # Use the fixer for the bundle as well, in case it contains internal URLs 
     return await _proxy_and_fix_js("/static/tracker.bundle.js", request.url.query) 
 
 @app.get("/integrations/assets/ga4-loader-{site_id}.js") 
@@ -357,7 +317,7 @@ async def ga4_loader_js(site_id: str, request: Request):
     return await _proxy_and_fix_js(f"/integrations/assets/ga4-loader-{site_id}.js", request.url.query) 
 
 # ------------------------------------------------------------------------------ 
-# Event forwarding (Now includes Blocked Site ID check) 
+# Event forwarding (with added debugs) 
 # ------------------------------------------------------------------------------ 
 @app.options("/api/collect") 
 @app.options("/api/collect/batch") 
@@ -368,15 +328,21 @@ async def options_preflight():
 async def collect_single(request: Request): 
     data = await request.json() 
     
+    site_id, site_token = _get_site_identity(data)
+    origin = request.headers.get('origin', 'unknown')
+    referer = request.headers.get('referer', 'unknown')
+    
+    # FIX #3: ADD COMPREHENSIVE DEBUGGING LOG
+    log.info(f"[collect-single-DEBUG] INCOMING: site_id={site_id}, token={site_token[:10] if site_token else 'none'}..., origin={origin}, referer={referer}, events=1")
+    
     # 1. Secret Check 
     if API_SECRET and not _validate_secret(data): 
-        log.warning(f"[collect] UNAUTHORIZED single: Invalid secret from site_id={data.get('site_id')}") 
+        log.warning(f"[collect] UNAUTHORIZED single: Invalid secret from site_id={site_id}") 
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401) 
         
     # 2. Block Site ID Check 
     if _is_blocked_site(data): 
-        site_id, _ = _get_site_identity(data) 
-        log.warning(f"[collect] BLOCKED single: site_id={site_id}") 
+        log.error(f"[collect] BLOCKED single: site_id={site_id} is in BLOCKED_SITE_IDS: {BLOCKED_SITE_IDS}") 
         return JSONResponse({"ok": False, "blocked": True, "reason": "blocked site"}, status_code=403) 
     
     # 3. Identity Check 
@@ -384,7 +350,7 @@ async def collect_single(request: Request):
         log.warning("[collect] dropped single: missing site identity") 
         return JSONResponse({"ok": True, "dropped": True, "reason": "missing site identity"}, status_code=200) 
         
-    log.info("[collect] single event received") 
+    log.info("[collect] single event received - forwarding.") 
     return await _forward_json("/api/collect", data, request, method="POST") 
 
 @app.post("/api/collect/batch") 
@@ -393,16 +359,20 @@ async def collect_batch(request: Request):
     events = data.get("events") if isinstance(data, dict) else [] 
     count = len(events) if isinstance(events, list) else 0 
     
+    site_id, site_token = _get_site_identity(data)
+    origin = request.headers.get('origin', 'unknown')
+    
+    # FIX #3: ADD COMPREHENSIVE DEBUGGING LOG
+    log.info(f"[collect-batch-DEBUG] INCOMING: site_id={site_id}, token={site_token[:10] if site_token else 'none'}..., origin={origin}, events={count}")
+
     # 1. Secret Check 
     if API_SECRET and not _validate_secret(data): 
-        site_id, _ = _get_site_identity(data) 
         log.warning(f"[collect] UNAUTHORIZED batch: Invalid secret from site_id={site_id}") 
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401) 
 
     # 2. Block Site ID Check 
     if _is_blocked_site(data): 
-        site_id, _ = _get_site_identity(data) 
-        log.warning(f"[collect] BLOCKED batch: site_id={site_id}") 
+        log.error(f"[collect] BLOCKED batch: site_id={site_id} is in BLOCKED_SITE_IDS: {BLOCKED_SITE_IDS}") 
         return JSONResponse({"ok": False, "blocked": True, "reason": "blocked site"}, status_code=403) 
 
     if not count: 
@@ -414,14 +384,12 @@ async def collect_batch(request: Request):
         log.warning("[collect] dropped batch: missing site identity") 
         return JSONResponse({"ok": True, "dropped": True, "reason": "missing site identity"}, status_code=200) 
     
-    site_id, _ = _get_site_identity(data) 
-    origin = request.headers.get('origin', 'unknown') 
-    log.info(f"[collect] batch received events={count} site_id={site_id} origin={origin}") 
+    log.info(f"[collect] batch received events={count} site_id={site_id} - forwarding.") 
     
     return await _forward_json("/api/collect/batch", data, request, method="POST") 
 
 # ------------------------------------------------------------------------------ 
-# Diagnostics and Debugging 
+# Diagnostics and Debugging (unchanged) 
 # ------------------------------------------------------------------------------ 
 @app.get("/diag/forwards") 
 async def diag_forwards(token: Optional[str] = None): 
@@ -466,7 +434,6 @@ async def debug_inspect(file: str, token: Optional[str] = None):
 # ------------------------------------------------------------------------------ 
 if __name__ == "__main__": 
     import uvicorn 
-    # Must use 'main:app' if the file is named main.py, otherwise update the first argument
     uvicorn.run( 
         app, 
         host="0.0.0.0", 
