@@ -44,16 +44,18 @@ SITE_URL_MAP = {
     "6":  ["baobrain.test.com"],
     "8":  ["2fdxrvrqqc"],
     "12": ["koftpobuae"],
-    "16": ["baobrain.com"],              # Only the domain
+    "16": ["baobrain.com"],
     "17": ["bcwxdbhdjm"],
     "18": ["prtidrdund"],
     "19": ["js3ghti4c3"],
     "21": ["al8xm9uqyn"],
-    "22": ["ilgxsy4t82"],               # ⛔ kiwla.com removed from 22
-    "24": ["baobraintest.myshopify.com", "kiwla.com"], # ✅ kiwla.com added to 24
+    # ✅ kiwla.com belongs to 22 (plus the BC store hash)
+    "22": ["ilgxsy4t82", "kiwla.com"],
+    # ❌ do NOT list kiwla.com here
+    "24": ["baobraintest.myshopify.com"],
     "26": ["bbtesr.myshopify.com"],
+    "27": ["eywisirpku"],
 }
-
 # ------------------------------------------------------------------------------
 # Logging
 # ------------------------------------------------------------------------------
