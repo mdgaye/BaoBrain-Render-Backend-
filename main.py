@@ -14,29 +14,24 @@ from starlette.responses import JSONResponse
 # ------------------------------------------------------------------------------
 UPSTREAM_BASE = os.getenv("UPSTREAM_BASE", "https://api.baobrain.com")
 FORWARD_TIMEOUT = float(os.getenv("FORWARD_TIMEOUT_SEC", "30"))
-FORWARD_RETRIES = int(os.getenv("FORWARD_RETRIES", "2")) # number of retries on 5xx
+FORWARD_RETRIES = int(os.getenv("FORWARD_RETRIES", "2"))  # retries on 5xx
 DIAG_BUFFER_SIZE = int(os.getenv("DIAG_BUFFER_SIZE", "100"))
-
-# optional: restrict /diag/forwards with a simple token
-DIAG_TOKEN = os.getenv("DIAG_TOKEN", "") # if set, require ?token=...
+DIAG_TOKEN = os.getenv("DIAG_TOKEN", "")  # require ?token=... if set
 
 # ------------------------------------------------------------------------------
 # Logging
 # ------------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("baobrain-proxy")
-
-# keep a small ring buffer of recent forward attempts
-last_forwards = deque(maxlen=DIAG_BUFFER_SIZE)
+last_forwards = deque(maxlen=DIAG_BUFFER_SIZE)  # ring buffer of recent forwards
 
 # ------------------------------------------------------------------------------
 # App + CORS
 # ------------------------------------------------------------------------------
-app = FastAPI(title="BaoBrain proxy", version="1.0.0")
-
+app = FastAPI(title="BaoBrain proxy", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # tighten if you want
+    allow_origins=["*"],            # tighten for production if needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -46,15 +41,12 @@ app.add_middleware(
 # Helpers
 # ------------------------------------------------------------------------------
 async def _proxy_get(path: str, query_string: str = "", media_type: str = "text/javascript") -> Response:
-    """
-    GET a file from the upstream and stream it back as-is.
-    """
+    """GET a file from the upstream and stream it back as-is."""
     full_path = f"{path}?{query_string}" if query_string else path
     url = f"{UPSTREAM_BASE}{full_path}"
     log.info(f"[proxy-get] {url}")
     async with httpx.AsyncClient(timeout=FORWARD_TIMEOUT) as client:
         r = await client.get(url)
-    # bubble upstream code but default to 200 for static assets (safer for CDNs)
     return Response(
         content=r.content,
         media_type=media_type,
@@ -75,13 +67,12 @@ async def _forward_json(
 ) -> Response:
     """
     Forward JSON to upstream with simple retries on 5xx.
-    Returns 200 to caller, with upstream status in header.
+    Always returns 200 to caller; upstream code is echoed in headers/diagnostics.
     """
     url = f"{UPSTREAM_BASE}{upstream_path}"
-    origin = request.headers.get("origin") or request.client.host if request.client else "unknown"
+    origin = request.headers.get("origin") or (request.client.host if request.client else "unknown")
     ua = request.headers.get("user-agent", "-")
 
-    # minimal headers to forward
     headers = {
         "Content-Type": "application/json",
         "X-Forwarded-For": request.headers.get("x-forwarded-for", request.client.host if request.client else ""),
@@ -101,15 +92,11 @@ async def _forward_json(
                     r = await client.post(url, json=payload, headers=headers)
                 else:
                     r = await client.request(method.upper(), url, json=payload, headers=headers)
-
                 upstream_status = r.status_code
-                # try parse JSON, fall back to raw text
                 try:
                     upstream_body = r.json()
                 except Exception:
                     upstream_body = r.text
-
-                # break on non-5xx
                 if r.status_code < 500:
                     break
                 log.warning(f"[forward] 5xx from upstream (attempt {i+1}/{attempts}) code={r.status_code}")
@@ -117,29 +104,43 @@ async def _forward_json(
                 err_text = str(e)
                 log.error(f"[forward] exception on attempt {i+1}/{attempts}: {err_text}")
                 if i == attempts - 1:
-                    upstream_status = 599 # non-standard: network error
+                    upstream_status = 599  # network error sentinel
 
-    # record a compact diagnostic
+    # record compact diagnostics (event count + site markers)
     try:
         evt_count = 0
+        site_token_dbg = None
+        site_id_dbg = None
+        shop_dbg = None
         if isinstance(payload, dict):
             if "events" in payload and isinstance(payload["events"], list):
                 evt_count = len(payload["events"])
-            elif "event" in payload:
+                if payload["events"]:
+                    first = payload["events"][0]
+                    site_token_dbg = first.get("site_token") or payload.get("site_token")
+                    site_id_dbg = first.get("site_id") or payload.get("site_id")
+                    shop_dbg = first.get("shop") or payload.get("shop")
+            else:
                 evt_count = 1
+                site_token_dbg = payload.get("site_token")
+                site_id_dbg = payload.get("site_id")
+                shop_dbg = payload.get("shop")
+
         last_forwards.append(
             {
                 "ts": int(time.time()),
                 "path": upstream_path,
                 "upstream": upstream_status,
                 "events": evt_count,
+                "site_token": site_token_dbg,
+                "site_id": site_id_dbg,
+                "shop": shop_dbg,
                 "err": err_text,
             }
         )
     except Exception:
         pass
 
-    # we **intentionally** return 200 to the client so their page flow never breaks
     body = {
         "ok": True,
         "forwarded_to": url,
@@ -173,7 +174,6 @@ async def bc_sessions_js(request: Request):
 async def bc_tracker_js(request: Request):
     return await _proxy_get("/bigcommerce/tracker.js", request.url.query, "text/javascript")
 
-# SHOPIFY ROUTES - should proxy, not serve local files
 @app.get("/shopify/sessions.js")
 async def shopify_sessions_js(request: Request):
     return await _proxy_get("/shopify/sessions.js", request.url.query, "text/javascript")
@@ -194,27 +194,34 @@ async def demographics_js(request: Request):
 async def demographics_static_js(request: Request):
     return await _proxy_get("/static/demographics.js", request.url.query, "text/javascript")
 
+# ------------------------------------------------------------------------------
+# Pixel loader (fixed): pass identity via data-* so bundle can read it
+# ------------------------------------------------------------------------------
 @app.get("/pixel.js")
 async def pixel_js(request: Request):
-    # Read incoming query params exactly as your integrations send them
     qp = dict(request.query_params)
-    site_id = qp.get("site_id", "")
-    site_token = qp.get("site_token", "")
-    shop = qp.get("shop", "")
+    site_id = (qp.get("site_id") or "").strip()
+    site_token = (qp.get("site_token") or "").strip()
+    shop = (qp.get("shop") or "").strip()
 
-    # Point to your real backend that actually serves the bundle
-    # UPSTREAM_BASE already comes from env; ensure it's your Cloud Run / API base and HTTPS.
-    tracker_url = (
-        f"{UPSTREAM_BASE.rstrip('/')}/static/tracker.bundle.js"
-        f"?site_id={site_id}&site_token={site_token}&shop={shop}"
-    )
+    # Optional: enforce at least site_token to catch misconfigs early
+    if not site_token:
+        log.warning("[pixel] missing site_token")
+        return Response("/* missing site_token */", media_type="application/javascript", status_code=200)
 
-    # Return JS loader so browsers won’t block it as mixed content
+    tracker_src = f"{UPSTREAM_BASE.rstrip('/')}/static/tracker.bundle.js"
+
+    # Use setAttribute to generate kebab-case data-* attrs explicitly
     js = (
-        "(function(){var s=document.createElement('script');"
+        "(function(){"
+        "var s=document.createElement('script');"
         "s.async=true;"
-        f"s.src='{tracker_url}';"
-        "document.head.appendChild(s);})();"
+        f"s.src='{tracker_src}';"
+        f"s.setAttribute('data-site-id', {repr(site_id)});"
+        f"s.setAttribute('data-site-token', {repr(site_token)});"
+        f"s.setAttribute('data-shop', {repr(shop)});"
+        "document.head.appendChild(s);"
+        "})();"
     )
 
     return Response(
@@ -233,24 +240,45 @@ async def ga4_loader_js(site_id: str, request: Request):
     return await _proxy_get(f"/integrations/assets/ga4-loader-{site_id}.js", request.url.query, "text/javascript")
 
 # ------------------------------------------------------------------------------
-# Event forwarding
+# Event forwarding (guards missing identity to avoid default-site pollution)
 # ------------------------------------------------------------------------------
 @app.options("/api/collect")
 @app.options("/api/collect/batch")
 async def options_preflight():
-    # CORS middleware already handles most, but returning 200 explicitly is fine
     return Response(status_code=200)
+
+def _has_identity(d: Dict[str, Any]) -> bool:
+    if not isinstance(d, dict):
+        return False
+    if d.get("site_token") or d.get("site_id"):
+        return True
+    evs = d.get("events")
+    if isinstance(evs, list) and evs:
+        first = evs[0]
+        if isinstance(first, dict) and (first.get("site_token") or first.get("site_id")):
+            return True
+    return False
 
 @app.post("/api/collect")
 async def collect_single(request: Request):
     data = await request.json()
+    if not _has_identity(data):
+        log.warning("[collect] dropped single: missing site identity")
+        return JSONResponse({"ok": True, "dropped": True, "reason": "missing site identity"}, status_code=200)
     log.info("[collect] single event received")
     return await _forward_json("/api/collect", data, request, method="POST")
 
 @app.post("/api/collect/batch")
 async def collect_batch(request: Request):
     data = await request.json()
-    count = len(data.get("events", [])) if isinstance(data, dict) else 0
+    events = data.get("events") if isinstance(data, dict) else []
+    count = len(events) if isinstance(events, list) else 0
+    if not count:
+        log.warning("[collect] dropped batch: empty events array")
+        return JSONResponse({"ok": True, "dropped": True, "reason": "empty batch"}, status_code=200)
+    if not _has_identity(data):
+        log.warning("[collect] dropped batch: missing site identity")
+        return JSONResponse({"ok": True, "dropped": True, "reason": "missing site identity"}, status_code=200)
     log.info(f"[collect] batch received events={count}")
     return await _forward_json("/api/collect/batch", data, request, method="POST")
 
