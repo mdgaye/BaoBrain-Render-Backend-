@@ -40,24 +40,20 @@ NO_CACHE = {
 BOT_UA_PAT = re.compile(r"(googlebot|bingbot|baiduspider|yandex|duckduckbot)", re.I)
 
 # 2) Normalized Domain Map (Domains, Shopify hashes, and BigCommerce hashes)
-# EDITED: Updated SITE_URL_MAP with new BigCommerce domains.
+# EDITED: Updated SITE_URL_MAP with new BigCommerce domains (site IDs 8, 12, 19, 27).
 SITE_URL_MAP = {
     "1":  ["tt65d.myshopify.com"],
     "6":  ["baobrain.test.com"],
-    # EDITED: Added resolved mybigcommerce domain
     "8":  ["2fdxrvrqqc", "baobrain-r7.mybigcommerce.com"], 
-    # EDITED: Added resolved mybigcommerce domain
     "12": ["koftpobuae", "store-koftpobuae.mybigcommerce.com"],
     "16": ["baobrain.com"],
     "17": ["versare.com", "bcwxdbhdjm"],
     "18": ["mavoli.com", "prtidrdund"],
-    # EDITED: Added resolved mybigcommerce domain
     "19": ["js3ghti4c3", "store-js3ghti4c3.mybigcommerce.com"],
     "21": ["gandjbaby.co.uk", "al8xm9uqyn"],
     "22": ["kiwla.com", "ilgxsy4t82"],
     "24": ["baobraintest.myshopify.com"],
     "26": ["bbtesr.myshopify.com"],
-    # EDITED: Added resolved mybigcommerce domain
     "27": ["eywisirpku", "test3.mybigcommerce.com"],
 }
 # ------------------------------------------------------------------------------
@@ -458,6 +454,8 @@ async def health():
 @app.get("/demographics.js")
 @app.get("/static/demographics.js")
 @app.get("/pixel.js")
+# ADDED: The missing GA4 loader path
+@app.get("/integrations/assets/ga4-loader-1.js") 
 async def legacy_js(request: Request):
     path = request.url.path
     query = request.url.query
@@ -614,6 +612,10 @@ async def collect_batch(request: Request):
     else:
         # On legacy host during migration, log & allow (pass-through mode)
         log.info(f"[collect-batch] legacy host pass-through accepted for site_id={site_id}")
+
+    if API_SECRET and not _validate_secret(data):
+        log.warning(f"[collect-batch] UNAUTHORIZED (bad secret) site_id={site_id}")
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
 
     if not count:
         log.warning("[collect-batch] dropped: empty events array.")
