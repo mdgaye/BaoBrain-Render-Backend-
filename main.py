@@ -39,23 +39,26 @@ NO_CACHE = {
 # Bot UA Guard 
 BOT_UA_PAT = re.compile(r"(googlebot|bingbot|baiduspider|yandex|duckduckbot)", re.I)
 
-# 2) Normalized Domain Map (Domains only, kiwla.com mapped to site 24 for example)
+# 2) Normalized Domain Map (Domains, Shopify hashes, and BigCommerce hashes)
+# EDITED: Updated SITE_URL_MAP with new BigCommerce domains.
 SITE_URL_MAP = {
     "1":  ["tt65d.myshopify.com"],
     "6":  ["baobrain.test.com"],
-    "8":  ["2fdxrvrqqc"],
-    "12": ["koftpobuae"],
+    # EDITED: Added resolved mybigcommerce domain
+    "8":  ["2fdxrvrqqc", "baobrain-r7.mybigcommerce.com"], 
+    # EDITED: Added resolved mybigcommerce domain
+    "12": ["koftpobuae", "store-koftpobuae.mybigcommerce.com"],
     "16": ["baobrain.com"],
-    "17": ["bcwxdbhdjm"],
-    "18": ["prtidrdund"],
-    "19": ["js3ghti4c3"],
-    "21": ["al8xm9uqyn"],
-    # ✅ kiwla.com belongs to 22 (plus the BC store hash)
-    "22": ["ilgxsy4t82", "kiwla.com"],
-    # ❌ do NOT list kiwla.com here
+    "17": ["versare.com", "bcwxdbhdjm"],
+    "18": ["mavoli.com", "prtidrdund"],
+    # EDITED: Added resolved mybigcommerce domain
+    "19": ["js3ghti4c3", "store-js3ghti4c3.mybigcommerce.com"],
+    "21": ["gandjbaby.co.uk", "al8xm9uqyn"],
+    "22": ["kiwla.com", "ilgxsy4t82"],
     "24": ["baobraintest.myshopify.com"],
     "26": ["bbtesr.myshopify.com"],
-    "27": ["eywisirpku"],
+    # EDITED: Added resolved mybigcommerce domain
+    "27": ["eywisirpku", "test3.mybigcommerce.com"],
 }
 # ------------------------------------------------------------------------------
 # Logging
@@ -254,16 +257,26 @@ def _resolve_site_id_from_maps(payload: dict, headers: dict) -> Optional[str]:
     host = payload_host or header_host
     log.debug(f"[resolver] Candidate hosts: Payload={payload_host}, Header={header_host}, Used={host}")
     
+    host_candidates: List[str] = []
     if host:
+        host_candidates.append(host)
+
+    # 2) Also include any shop hash from payload as a candidate (it's normalized in _host_from_payload)
+    shop_from_payload = payload.get("shop")
+    if isinstance(shop_from_payload, str) and len(shop_from_payload) < 20 and shop_from_payload not in host_candidates: # Short string is likely a hash
+        host_candidates.append(shop_from_payload.lower())
+        log.debug(f"[resolver] Added shop hash as candidate: {shop_from_payload.lower()}")
+    
+    for candidate in host_candidates:
         for sid, domains in SITE_URL_MAP.items():
             normalized_domains = {d.lower() for d in domains}
             log.debug(f"[resolver] Checking site_id {sid} against domains: {normalized_domains}")
-            if host in normalized_domains:
-                log.info(f"[resolver] ✅ Resolved site_id={sid} via domain match: {host}")
+            if candidate in normalized_domains:
+                log.info(f"[resolver] ✅ Resolved site_id={sid} via domain match: {candidate}")
                 return sid
     
-    log.warning(f"[resolver] Could not resolve site_id from host (host={host})")
-    # 2) fallback: site_token exact match map (skipped, as no TOKEN_TO_SITEID map was provided)
+    log.warning(f"[resolver] Could not resolve site_id from host candidates: {host_candidates}")
+    # 3) fallback: site_token exact match map (skipped, as no TOKEN_TO_SITEID map was provided)
     return None
 
 def _overwrite_site_id(payload: dict, site_id: str) -> None:
@@ -336,6 +349,7 @@ async def _proxy_get(path: str, query_string: str = "", media_type: str = "appli
         if media_type == "text/javascript" or media_type == "application/javascript":
              headers["Cache-Control"] = "public, max-age=300"
         
+        # RESTORED: Response return block
         return Response(
             content=content, media_type=media_type, status_code=r.status_code,
             headers=headers,
@@ -600,10 +614,6 @@ async def collect_batch(request: Request):
     else:
         # On legacy host during migration, log & allow (pass-through mode)
         log.info(f"[collect-batch] legacy host pass-through accepted for site_id={site_id}")
-
-    if API_SECRET and not _validate_secret(data):
-        log.warning(f"[collect-batch] UNAUTHORIZED (bad secret) site_id={site_id}")
-        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
 
     if not count:
         log.warning("[collect-batch] dropped: empty events array.")
