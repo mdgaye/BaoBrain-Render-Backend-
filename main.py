@@ -23,6 +23,7 @@ DIAG_TOKEN = os.getenv("DIAG_TOKEN", "")
 # === Security Config ===
 API_SECRET = os.getenv("API_SECRET")
 # 1) Parse a real blocklist from env
+# ⚠️ CRITICAL DEBUG NOTE: If other sites are not forwarding, check this ENV VAR!
 BLOCKED_SITE_IDS = {s.strip() for s in os.getenv("BLOCKED_SITE_IDS", "").split(",") if s.strip()}
 # -----------------------
 
@@ -64,7 +65,7 @@ log = logging.getLogger("baobrain-proxy")
 log.setLevel(logging.DEBUG) # Enforce DEBUG level for max logs
 last_forwards = deque(maxlen=DIAG_BUFFER_SIZE)
 
-# FIX 3a: Change target site ID to an int
+# FIX 3a: Target site ID is used only for enhanced logging (as int)
 TARGET_SITE_ID = 22
 log.debug(f"[config] UPSTREAM_BASE={UPSTREAM_BASE}, FORWARD_TIMEOUT={FORWARD_TIMEOUT}")
 log.debug(f"[config] LEGACY_HOST={LEGACY_HOST}, NUKE_OLD_HOST={NUKE_OLD_HOST}")
@@ -102,9 +103,9 @@ def _is_bot(request: Request) -> bool:
 
 # === Security / Validation Helpers ===
 def _is_blocked_site_id(site_id: Optional[str]) -> bool:
-    """Checks if a site ID is in the environment-configured block list."""
+    """Checks if a site ID (string) is in the environment-configured block list."""
     is_blocked = site_id is not None and site_id in BLOCKED_SITE_IDS
-    log.debug(f"[block_check] Site ID: {site_id}, Is Blocked: {is_blocked}")
+    log.debug(f"[block_check] Site ID: {site_id} (Checking against {BLOCKED_SITE_IDS}), Is Blocked: {is_blocked}")
     return is_blocked
 
 def _validate_secret(d: Dict[str, Any]) -> bool:
@@ -114,7 +115,6 @@ def _validate_secret(d: Dict[str, Any]) -> bool:
 
 def _get_site_identity(d: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
     # Tries to extract site_id and site_token from top level or first event
-    # NOTE: site_id will be extracted as whatever type it is in the payload (str or int)
     site_id_raw = d.get("site_id")
     site_token = d.get("site_token")
     log.debug(f"[_get_site_identity] Initial: site_id={site_id_raw}, site_token={site_token}")
@@ -403,7 +403,7 @@ async def _forward_json(
     log.info(f"[{request_id}] [forward] START | Method={method} | Path={upstream_path} | IP={client_ip} | Origin={origin}")
     log.debug(f"[{request_id}] [forward] PAYLOAD_INFO | Count={evt_count} | SiteID={site_id_dbg} (Overwritten) | Shop={shop_dbg} | Token={site_token_dbg}")
 
-    # FIX 3b: Check target site ID as int (or safely cast to int)
+    # FIX 3b: Check target site ID as int (or safely cast to int) - This is for LOGGING ONLY
     try:
         if site_id_dbg is not None and int(site_id_dbg) == TARGET_SITE_ID:
             log.critical(f"[{request_id}] [forward] 🚨🚨 TARGET SITE {TARGET_SITE_ID} DETECTED! | Payload={payload} 🚨🚨")
@@ -548,8 +548,6 @@ async def options_preflight(request: Request):
 async def collect_single(request: Request):
     log.info("[collect] START single event processing.")
     
-    # REMOVED: Early 410 on legacy host is removed to allow forwarding/migration
-
     try:
         data = await request.json()
         if not isinstance(data, dict):
@@ -573,17 +571,15 @@ async def collect_single(request: Request):
         log.warning(f"[collect] invalid resolved site_id '{resolved_sid}' (not int); dropping.")
         return JSONResponse({"ok": True, "dropped": True, "reason": "invalid resolved site_id"}, status_code=200)
 
-    # Optional quarantine
-    if _is_blocked_site_id(resolved_sid): # BLOCKED_SITE_IDS are strings, so use resolved_sid (string)
-        log.critical(f"[collect] BLOCKED site_id={resolved_sid} (Blocklist)")
+    # 🛑 CRITICAL CHECK: The reason other sites are not forwarding is likely here.
+    if _is_blocked_site_id(resolved_sid): 
+        log.critical(f"[collect] BLOCKED site_id={resolved_sid} (Blocklist) 🛑 CHECK ENV VAR: BLOCKED_SITE_IDS")
         return JSONResponse({"ok": False, "blocked": True, "reason": "blocked site"}, status_code=403)
     
     # Overwrite ANY client-provided site_id with the resolved one (coerced to int)
-    # _overwrite_site_id will now return False if the coercion failed (though we check above)
     if not _overwrite_site_id(data, resolved_sid):
-        return JSONResponse({"ok": True, "dropped": True, "reason": "invalid resolved site_id"}, status_code=200)
+        return JSONResponse({"ok": True, "dropped": True, "reason": "internal site_id error"}, status_code=200)
 
-    # Use the authoritative ID for checks (we use the string version for consistency with maps)
     site_id_str = resolved_sid 
 
     # EDITED: Stricter origin check is skipped on legacy host for migration safety
@@ -609,8 +605,6 @@ async def collect_single(request: Request):
 async def collect_batch(request: Request):
     log.info("[collect-batch] START batch event processing.")
     
-    # REMOVED: Early 410 on legacy host is removed to allow forwarding/migration
-
     try:
         data = await request.json()
         if not isinstance(data, dict):
@@ -638,17 +632,15 @@ async def collect_batch(request: Request):
         log.warning(f"[collect-batch] invalid resolved site_id '{resolved_sid}' (not int); dropping.")
         return JSONResponse({"ok": True, "dropped": True, "reason": "invalid resolved site_id"}, status_code=200)
 
-    # Optional quarantine
-    if _is_blocked_site_id(resolved_sid): # BLOCKED_SITE_IDS are strings, so use resolved_sid (string)
-        log.critical(f"[collect-batch] BLOCKED site_id={resolved_sid} (Blocklist)")
+    # 🛑 CRITICAL CHECK: The reason other sites are not forwarding is likely here.
+    if _is_blocked_site_id(resolved_sid):
+        log.critical(f"[collect-batch] BLOCKED site_id={resolved_sid} (Blocklist) 🛑 CHECK ENV VAR: BLOCKED_SITE_IDS")
         return JSONResponse({"ok": False, "blocked": True, "reason": "blocked site"}, status_code=403)
     
     # Overwrite ANY client-provided site_id with the resolved one (coerced to int)
-    # _overwrite_site_id will now return False if the coercion failed (though we check above)
     if not _overwrite_site_id(data, resolved_sid):
-        return JSONResponse({"ok": True, "dropped": True, "reason": "invalid resolved site_id"}, status_code=200)
+        return JSONResponse({"ok": True, "dropped": True, "reason": "internal site_id error"}, status_code=200)
 
-    # Use the authoritative ID for checks (we use the string version for consistency with maps)
     site_id_str = resolved_sid
     
     # EDITED: Stricter origin check is skipped on legacy host for migration safety
